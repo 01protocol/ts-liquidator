@@ -5,6 +5,7 @@ import {
     Cluster,
     Margin,
     MarginsCluster,
+    MarketInfo,
     sleep,
     USDC_DECIMALS,
     USDC_DEVNET_MINT_ADDRESS,
@@ -74,7 +75,7 @@ export default class Liquidator {
         this.activeLiquidations++;
         const liqeeMargin = this.margins[accountToLiquidate]!;
         while (liqeeMargin.isLiquidatableWithTolerance(LIQUIDATION_TOLERANCE)) {
-            log.info('Liquidating: ', liqeeMargin.data.authority.toString());
+            log.info(`[${liqeeMargin.pubkey.toString()}]`,'Liquidating: ', liqeeMargin.data.authority.toString());
             if (liqeeMargin.isBankrupt) {
                 await this.bankruptAccount(liqeeMargin)
                 continue;
@@ -83,7 +84,7 @@ export default class Liquidator {
         }
         this.toLiquidate[accountToLiquidate] = null;
         this.activeLiquidations--;
-        log.info('Finished liquidating: ', liqeeMargin.pubkey.toString());
+        log.info(`[${liqeeMargin.pubkey.toString()}]`,'Finished liquidating: ', liqeeMargin.pubkey.toString());
     }
 
     private async liquidateAccount(liqeeMargin: Margin) {
@@ -116,7 +117,8 @@ export default class Liquidator {
             liqeeMargin.largestWeightedBorrow.symbol
         );
         try {
-            log.info('Bankrupting ', liqeeMargin.largestWeightedBorrow.symbol);
+            log.info(`[${liqeeMargin.pubkey.toString()}]`,'Bankrupting ', liqeeMargin.largestWeightedBorrow.symbol);
+            await this.cancelAllOrders(liqeeMargin)
             const tx = await this.program.rpc.settleBankruptcy({
                 accounts: {
                     state: this.state.pubkey,
@@ -130,7 +132,7 @@ export default class Liquidator {
                     assetMint: assetMint
                 }
             });
-            log.info('Bankruptcy complete for:' + liqeeMargin.pubkey.toString() + ' tx:' + this.getTxString(tx));
+            log.info(`[${liqeeMargin.pubkey.toString()}]`,'Bankruptcy complete for:' + liqeeMargin.pubkey.toString() + ' tx:' + this.getTxString(tx));
         } catch (_) {
             log.error(_);
         }
@@ -182,7 +184,7 @@ export default class Liquidator {
             },
             postInstructions: postInstructions
         });
-        log.info('Liquidated spot position' + assetSymbol + ' for ' + quoteSymbol + ': ', `${this.getTxString(tx)}`);
+        log.info(`[${margin.pubkey.toString()}]`,'Liquidated spot position' + assetSymbol + ' for ' + quoteSymbol + ': ', `${this.getTxString(tx)}`);
     }
 
     /**
@@ -252,8 +254,8 @@ export default class Liquidator {
             symbol
         );
         const market = await this.state.getMarketBySymbol(symbol);
-        const liqeeOo = await margin.getOpenOrdersInfoBySymbol(symbol);
         const isLong = margin.position(symbol).isLong;
+        const liqeeOo = await margin.getOpenOrdersInfoBySymbol(symbol);
         const cancelOrdersInstruction = this.getCancelOrdersInstruction(margin, liqeeOo, market)
         const closePositionInstruction = this.getClosePositionInstruction(symbol, isLong, market, liqorOo)
         const tx = await this.program.rpc.liquidatePerpPosition!(assetTransferLots, {
@@ -287,7 +289,7 @@ export default class Liquidator {
                 closePositionInstruction
             ]
         });
-        log.info('Liquidated Perp' + symbol + ':', `${this.getTxString(tx)}`);
+        log.info(`[${margin.pubkey.toString()}]`,'Liquidated Perp' + symbol + ':', `${this.getTxString(tx)}`);
         await this.liquidatorMargin.refresh(false);
     }
 
@@ -344,6 +346,24 @@ export default class Liquidator {
                 }
             }
         )
+    }
+
+    private async cancelAllOrders(margin: Margin) {
+        for (const marketInfo of Object.values(this.state.markets)) {
+            if (margin.orders.filter(order => order.symbol === marketInfo.symbol).length > 0) {
+                await this.cancelOrdersOnTheMarket(marketInfo, margin)
+            }
+        }
+    }
+
+    private async cancelOrdersOnTheMarket(marketInfo: MarketInfo, margin: Margin) {
+        const {dexMarket} = await this.state.getZoMarketAccounts(marketInfo);
+        const liqeeOo = await margin.getOpenOrdersInfoBySymbol(marketInfo.symbol);
+        let transaction = new Transaction()
+        const ix = this.getCancelOrdersInstruction(margin, liqeeOo, dexMarket)
+        transaction.add(ix)
+        const tx = await this.program.provider.send(transaction);
+        log.info(`[${margin.pubkey.toString()}]`,`Cancelled orders for ${marketInfo} : ${this.getTxString(tx)}`)
     }
 
     /**
